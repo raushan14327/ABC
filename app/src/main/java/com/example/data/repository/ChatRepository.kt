@@ -5,12 +5,15 @@ import android.util.Log
 import com.example.BuildConfig
 import com.example.data.database.*
 import com.example.data.encryption.MessageEncryption
+import com.google.android.gms.tasks.Tasks
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.Query
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -21,44 +24,241 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
-class ChatRepository(private val context: Context) {
-
-    private val database = AppDatabase.getDatabase(context)
-    
-    val chatDao = database.chatDao()
-    val messageDao = database.messageDao()
-    val userDao = database.userDao()
-    val groupDao = database.groupDao()
-    val callDao = database.callDao()
-    val notificationDao = database.notificationDao()
-    val blockedUserDao = database.blockedUserDao()
-    val settingsDao = database.settingsDao()
-
-    val allChats: Flow<List<ChatEntity>> = chatDao.getAllChatsFlow()
-    val allCalls: Flow<List<CallEntity>> = callDao.getAllCalls()
-    val allNotifications: Flow<List<NotificationEntity>> = notificationDao.getAllNotifications()
-
-    private val repositoryScope = CoroutineScope(Dispatchers.IO)
-
-    private val prefs = context.getSharedPreferences("connect_chat_prefs", Context.MODE_PRIVATE)
-    private var realtimeJob: Job? = null
-
-    init {
-        // Initialize database with some realistic seed data on first run
-        repositoryScope.launch {
-            try {
-                seedDataIfEmpty()
-            } catch (e: Exception) {
-                Log.e("ChatRepository", "Error seeding database", e)
-            }
-        }
-        val savedId = getSavedUserId()
-        if (savedId != null && isSavedAuthenticated()) {
-            startRealtimeConnection(savedId)
+class FirestoreUserDao(private val firestore: FirebaseFirestore) {
+    fun getAllUsers(): Flow<List<UserEntity>> {
+        return callbackFlow {
+            val listener = firestore.collection("users")
+                .addSnapshotListener { snapshot, error ->
+                    if (error != null) return@addSnapshotListener
+                    if (snapshot != null) {
+                        val list = snapshot.documents.mapNotNull { doc ->
+                            try {
+                                UserEntity(
+                                    id = doc.getString("id") ?: doc.id,
+                                    name = doc.getString("name") ?: "User",
+                                    photoUrl = doc.getString("photoUrl") ?: "",
+                                    bio = doc.getString("bio") ?: "",
+                                    statusText = doc.getString("statusText") ?: "Online",
+                                    isOnline = doc.getBoolean("isOnline") ?: false,
+                                    lastSeen = doc.getLong("lastSeen") ?: 0L
+                                )
+                            } catch (e: Exception) {
+                                null
+                            }
+                        }
+                        trySend(list)
+                    }
+                }
+            awaitClose { listener.remove() }
         }
     }
 
-    // --- SharedPreferences Persistence for Authentication ---
+    suspend fun insertUser(user: UserEntity) {
+        val userMap = hashMapOf(
+            "id" to user.id,
+            "name" to user.name,
+            "photoUrl" to user.photoUrl,
+            "bio" to user.bio,
+            "statusText" to user.statusText,
+            "isOnline" to user.isOnline,
+            "lastSeen" to user.lastSeen
+        )
+        Tasks.await(firestore.collection("users").document(user.id).set(userMap))
+    }
+}
+
+class FirestoreChatDao(private val firestore: FirebaseFirestore) {
+    suspend fun getChatById(chatId: String): ChatEntity? {
+        val doc = Tasks.await(firestore.collection("chats").document(chatId).get())
+        if (!doc.exists()) return null
+        return ChatEntity(
+            id = doc.id,
+            name = doc.getString("name") ?: "Chat",
+            isGroup = doc.getBoolean("isGroup") ?: false,
+            lastMessage = doc.getString("lastMessage") ?: "",
+            lastMessageTime = doc.getLong("lastMessageTime") ?: System.currentTimeMillis(),
+            isPinned = doc.getBoolean("isPinned") ?: false,
+            isArchived = doc.getBoolean("isArchived") ?: false,
+            isMuted = doc.getBoolean("isMuted") ?: false,
+            wallpaperPath = doc.getString("wallpaperPath")
+        )
+    }
+}
+
+class FirestoreNotificationDao(private val firestore: FirebaseFirestore) {
+    suspend fun insertNotification(notification: NotificationEntity) {
+        val notifMap = hashMapOf(
+            "id" to notification.id,
+            "userId" to notification.userId,
+            "title" to notification.title,
+            "body" to notification.body,
+            "timestamp" to notification.timestamp,
+            "isRead" to notification.isRead
+        )
+        Tasks.await(firestore.collection("notifications").document(notification.id).set(notifMap))
+    }
+}
+
+class ChatRepository(private val context: Context) {
+
+    private val prefs = context.getSharedPreferences("connect_chat_prefs", Context.MODE_PRIVATE)
+    private val repositoryScope = CoroutineScope(Dispatchers.IO)
+    private val firestore = FirebaseFirestore.getInstance()
+    private val auth = FirebaseAuth.getInstance()
+
+    // Public DAO helper properties for ViewModel access
+    val userDao = FirestoreUserDao(firestore)
+    val chatDao = FirestoreChatDao(firestore)
+    val notificationDao = FirestoreNotificationDao(firestore)
+
+    // 1. Reactive Auth State Flow to drive subsequent Firestore subscriptions
+    val authStateFlow: Flow<String?> = callbackFlow {
+        val listener = FirebaseAuth.AuthStateListener { firebaseAuth ->
+            val uid = firebaseAuth.currentUser?.uid
+            trySend(uid)
+        }
+        auth.addAuthStateListener(listener)
+        awaitClose { auth.removeAuthStateListener(listener) }
+    }
+
+    // 2. Real-time Subscription to Chats collection
+    val allChats: Flow<List<ChatEntity>> = authStateFlow.flatMapLatest { uid ->
+        val currentUid = uid ?: getSavedUserId() ?: "me"
+        if (currentUid == "me") {
+            flowOf(emptyList())
+        } else {
+            // Trigger background seeding of default Gemini chat if not present
+            repositoryScope.launch {
+                try {
+                    seedDefaultData(currentUid)
+                } catch (e: Exception) {
+                    Log.e("ChatRepository", "Error seeding default data", e)
+                }
+            }
+
+            callbackFlow {
+                val listener = firestore.collection("chats")
+                    .whereArrayContains("participants", currentUid)
+                    .addSnapshotListener { snapshot, error ->
+                        if (error != null) {
+                            Log.e("ChatRepository", "allChats snapshot listener error", error)
+                            return@addSnapshotListener
+                        }
+                        if (snapshot != null) {
+                            val list = snapshot.documents.mapNotNull { doc ->
+                                try {
+                                    ChatEntity(
+                                        id = doc.id,
+                                        name = doc.getString("name") ?: "Chat",
+                                        isGroup = doc.getBoolean("isGroup") ?: false,
+                                        lastMessage = doc.getString("lastMessage") ?: "",
+                                        lastMessageTime = doc.getLong("lastMessageTime") ?: System.currentTimeMillis(),
+                                        isPinned = doc.getBoolean("isPinned") ?: false,
+                                        isArchived = doc.getBoolean("isArchived") ?: false,
+                                        isMuted = doc.getBoolean("isMuted") ?: false,
+                                        wallpaperPath = doc.getString("wallpaperPath")
+                                    )
+                                } catch (e: Exception) {
+                                    null
+                                }
+                            }
+                            trySend(list)
+                        }
+                    }
+                awaitClose { listener.remove() }
+            }
+        }
+    }
+
+    // 3. Real-time Subscription to Calls log collection
+    val allCalls: Flow<List<CallEntity>> = authStateFlow.flatMapLatest { uid ->
+        val currentUid = uid ?: getSavedUserId() ?: "me"
+        if (currentUid == "me") {
+            flowOf(emptyList())
+        } else {
+            callbackFlow {
+                val listener1 = firestore.collection("calls")
+                    .whereEqualTo("callerId", currentUid)
+                    .addSnapshotListener { snapshot1, error1 ->
+                        if (error1 != null) {
+                            Log.e("ChatRepository", "allCalls list 1 error", error1)
+                            return@addSnapshotListener
+                        }
+                        firestore.collection("calls")
+                            .whereEqualTo("receiverId", currentUid)
+                            .addSnapshotListener { snapshot2, error2 ->
+                                if (error2 != null) {
+                                    Log.e("ChatRepository", "allCalls list 2 error", error2)
+                                    return@addSnapshotListener
+                                }
+                                val callsList = mutableListOf<CallEntity>()
+                                val docs = (snapshot1?.documents ?: emptyList()) + (snapshot2?.documents ?: emptyList())
+                                val distinctDocs = docs.distinctBy { it.id }
+                                for (doc in distinctDocs) {
+                                    try {
+                                        callsList.add(
+                                            CallEntity(
+                                                id = doc.id,
+                                                callerId = doc.getString("callerId") ?: "",
+                                                callerName = doc.getString("callerName") ?: "User",
+                                                receiverId = doc.getString("receiverId") ?: "",
+                                                receiverName = doc.getString("receiverName") ?: "User",
+                                                isVideo = doc.getBoolean("isVideo") ?: false,
+                                                status = doc.getString("status") ?: "COMPLETED",
+                                                startTime = doc.getLong("startTime") ?: System.currentTimeMillis(),
+                                                durationSec = doc.getLong("durationSec")?.toInt() ?: 0
+                                            )
+                                        )
+                                    } catch (e: Exception) {
+                                        // Ignore malformed
+                                    }
+                                }
+                                callsList.sortByDescending { it.startTime }
+                                trySend(callsList)
+                            }
+                    }
+                awaitClose { }
+            }
+        }
+    }
+
+    // 4. Real-time Subscription to Notifications
+    val allNotifications: Flow<List<NotificationEntity>> = authStateFlow.flatMapLatest { uid ->
+        val currentUid = uid ?: getSavedUserId() ?: "me"
+        if (currentUid == "me") {
+            flowOf(emptyList())
+        } else {
+            callbackFlow {
+                val listener = firestore.collection("notifications")
+                    .whereEqualTo("userId", currentUid)
+                    .addSnapshotListener { snapshot, error ->
+                        if (error != null) {
+                            return@addSnapshotListener
+                        }
+                        if (snapshot != null) {
+                            val list = snapshot.documents.mapNotNull { doc ->
+                                try {
+                                    NotificationEntity(
+                                        id = doc.id,
+                                        userId = doc.getString("userId") ?: "",
+                                        title = doc.getString("title") ?: "",
+                                        body = doc.getString("body") ?: "",
+                                        timestamp = doc.getLong("timestamp") ?: System.currentTimeMillis(),
+                                        isRead = doc.getBoolean("isRead") ?: false
+                                    )
+                                } catch (e: Exception) {
+                                    null
+                                }
+                            }
+                            trySend(list)
+                        }
+                    }
+                awaitClose { listener.remove() }
+            }
+        }
+    }
+
+    // --- SharedPreferences Persistence backing local variables ---
     fun saveUserIdentity(userId: String, name: String, phone: String, bio: String) {
         prefs.edit().apply {
             putString("my_user_id", userId)
@@ -68,108 +268,102 @@ class ChatRepository(private val context: Context) {
             putBoolean("is_authenticated", true)
             apply()
         }
-        // Start connection
-        startRealtimeConnection(userId)
     }
 
-    fun getSavedUserId(): String? = prefs.getString("my_user_id", null)
+    fun getSavedUserId(): String? = auth.currentUser?.uid ?: prefs.getString("my_user_id", null)
     fun getSavedName(): String = prefs.getString("my_name", "John") ?: "John"
     fun getSavedPhone(): String = prefs.getString("my_phone", "") ?: ""
     fun getSavedBio(): String = prefs.getString("my_bio", "Hey there! I am using ConnectChat.") ?: ""
-    fun isSavedAuthenticated(): Boolean = prefs.getBoolean("is_authenticated", false)
+    fun isSavedAuthenticated(): Boolean = auth.currentUser != null || prefs.getBoolean("is_authenticated", false)
 
-    private suspend fun seedDataIfEmpty() {
-        val existingChats = allChats.firstOrNull() ?: emptyList()
-        if (existingChats.isNotEmpty()) return
-
-        Log.d("ChatRepository", "Seeding database with ConnectChat demo data...")
-
-        // 1. Insert Core Users
-        val users = listOf(
-            UserEntity("me", "You (Me)", "", "Feeling happy! ✨", "Available", true, System.currentTimeMillis()),
-            UserEntity("gemini_assistant", "Gemini Assistant", "https://ai.google.dev/static/images/logo_gemini.png", "Official Gemini AI Partner", "Online", true, System.currentTimeMillis()),
-            UserEntity("john_doe", "John Doe", "", "Code is life 💻", "Busy", true, System.currentTimeMillis()),
-            UserEntity("alice_smith", "Alice Smith", "", "Living, laughing, loving", "Available", false, System.currentTimeMillis() - 3600000),
-            UserEntity("mom", "Mom ❤️", "", "Family first", "At work", true, System.currentTimeMillis()),
-            UserEntity("priya_sharma", "Priya Sharma", "", "Music & Coffee ☕🎵", "Online", true, System.currentTimeMillis()),
-            UserEntity("amit_patel", "Amit Patel", "", "Exploring the world 🌍", "Available", true, System.currentTimeMillis())
-        )
-        userDao.insertUsers(users)
-
-        // 2. Insert Default Chats (Only Gemini Assistant and Group are default, others require friend approval)
-        val chats = listOf(
-            ChatEntity("gemini_assistant", "Gemini Assistant", isGroup = false, lastMessage = "Welcome to ConnectChat! Let's talk.", lastMessageTime = System.currentTimeMillis() - 10000, isPinned = true),
-            ChatEntity("android_dev_group", "Android Dev Team 🤖", isGroup = true, lastMessage = "Compose 1.8 is amazing!", lastMessageTime = System.currentTimeMillis() - 1200000)
-        )
-        for (chat in chats) {
-            chatDao.insertChat(chat)
-        }
-
-        // 3. Insert Default Group
-        val devGroup = GroupEntity(
-            id = "android_dev_group",
-            name = "Android Dev Team 🤖",
-            description = "Official group for Android Jetpack Compose discussion.",
-            createdBy = "john_doe",
-            groupIcon = "",
-            adminIds = "john_doe",
-            memberIds = "me,john_doe,alice_smith"
-        )
-        groupDao.insertGroup(devGroup)
-
-        // 4. Insert Messages for chats (encrypted text)
-        val defaultMessages = listOf(
-            MessageEntity(chatId = "gemini_assistant", senderId = "gemini_assistant", text = MessageEncryption.encrypt("Hello! I am Gemini Assistant, your smart companion. Let me know what you want to talk about!"), timestamp = System.currentTimeMillis() - 10000, status = "SEEN"),
-            
-            MessageEntity(chatId = "john_doe", senderId = "me", text = MessageEncryption.encrypt("Hey John!"), timestamp = System.currentTimeMillis() - 120000, status = "SEEN"),
-            MessageEntity(chatId = "john_doe", senderId = "john_doe", text = MessageEncryption.encrypt("Are we on for soccer tonight? ⚽"), timestamp = System.currentTimeMillis() - 60000, status = "DELIVERED"),
-            
-            MessageEntity(chatId = "alice_smith", senderId = "alice_smith", text = MessageEncryption.encrypt("Hey, how's it going? Check out this beautiful photo!"), timestamp = System.currentTimeMillis() - 360000, status = "SEEN", mediaUrl = "https://images.unsplash.com/photo-1506744038136-46273834b3fb", mediaType = "IMAGE"),
-            
-            MessageEntity(chatId = "mom", senderId = "mom", text = MessageEncryption.encrypt("Call me when you're free, honey."), timestamp = System.currentTimeMillis() - 720000, status = "SEEN"),
-            
-            MessageEntity(chatId = "android_dev_group", senderId = "john_doe", text = MessageEncryption.encrypt("Hey all, did you try Jetpack Compose edge-to-edge?"), timestamp = System.currentTimeMillis() - 1500000, status = "SEEN"),
-            MessageEntity(chatId = "android_dev_group", senderId = "alice_smith", text = MessageEncryption.encrypt("Yes, it's super clean! Compose 1.8 is amazing!"), timestamp = System.currentTimeMillis() - 1200000, status = "SEEN")
-        )
-        for (msg in defaultMessages) {
-            messageDao.insertMessage(msg)
-        }
-
-        // 5. Seeding Default Calls
-        val defaultCalls = listOf(
-            CallEntity("call_1", "john_doe", "John Doe", "me", "You (Me)", isVideo = false, status = "COMPLETED", startTime = System.currentTimeMillis() - 1800000, durationSec = 120),
-            CallEntity("call_2", "me", "You (Me)", "alice_smith", "Alice Smith", isVideo = true, status = "MISSED", startTime = System.currentTimeMillis() - 3600000, durationSec = 0)
-        )
-        for (call in defaultCalls) {
-            callDao.insertCall(call)
-        }
-
-        // 6. Seeding Default Settings
-        val settings = UserSettingsEntity(
-            userId = "me",
-            isDarkMode = false,
-            isTwoFactorEnabled = false,
-            notificationsSoundEnabled = true,
-            privacyStatus = "EVERYONE",
-            lastSeenPrivacy = "EVERYONE"
-        )
-        settingsDao.insertSettings(settings)
-
-        // 7. Seed initial notification
-        notificationDao.insertNotification(
-            NotificationEntity(
-                id = "notif_1",
-                userId = "me",
-                title = "ConnectChat Installed!",
-                body = "Welcome to your high-security end-to-end encrypted chat platform.",
-                timestamp = System.currentTimeMillis()
+    // Seeding default chat & Gemini response on first login
+    private suspend fun seedDefaultData(myUid: String) {
+        val geminiRef = firestore.collection("users").document("gemini_assistant")
+        val docGemini = Tasks.await(geminiRef.get())
+        if (!docGemini.exists()) {
+            val geminiUser = hashMapOf(
+                "id" to "gemini_assistant",
+                "name" to "Gemini Assistant",
+                "photoUrl" to "https://ai.google.dev/static/images/logo_gemini.png",
+                "bio" to "Official Gemini AI Partner",
+                "statusText" to "Online",
+                "isOnline" to true,
+                "lastSeen" to System.currentTimeMillis()
             )
-        )
+            Tasks.await(geminiRef.set(geminiUser))
+        }
+
+        val chatGeminiId = "chat_gemini_${myUid}"
+        val chatRef = firestore.collection("chats").document(chatGeminiId)
+        val docChat = Tasks.await(chatRef.get())
+        if (!docChat.exists()) {
+            val geminiChat = hashMapOf(
+                "id" to chatGeminiId,
+                "name" to "Gemini Assistant",
+                "participants" to listOf(myUid, "gemini_assistant"),
+                "isGroup" to false,
+                "lastMessage" to "Welcome to ConnectChat! Let's talk.",
+                "lastMessageTime" to System.currentTimeMillis() - 10000,
+                "isPinned" to true,
+                "isArchived" to false,
+                "isMuted" to false,
+                "wallpaperPath" to null
+            )
+            Tasks.await(chatRef.set(geminiChat))
+
+            // Seed initial welcoming greeting message
+            val welcomeMsgId = System.currentTimeMillis()
+            val welcomeMsg = hashMapOf(
+                "id" to welcomeMsgId,
+                "chatId" to chatGeminiId,
+                "senderId" to "gemini_assistant",
+                "text" to MessageEncryption.encrypt("Hello! I am Gemini Assistant, your smart companion. Let me know what you want to talk about!"),
+                "timestamp" to System.currentTimeMillis() - 10000,
+                "status" to "SEEN",
+                "isStarred" to false,
+                "replyToMessageId" to null,
+                "reactions" to ""
+            )
+            Tasks.await(chatRef.collection("messages").document(welcomeMsgId.toString()).set(welcomeMsg))
+        }
     }
 
-    // --- Message Access & Sending ---
+    // --- Message Access & Real-Time Snapshots ---
     fun getMessagesFlow(chatId: String): Flow<List<MessageEntity>> {
-        return messageDao.getMessagesForChat(chatId)
+        return callbackFlow {
+            val listener = firestore.collection("chats").document(chatId)
+                .collection("messages")
+                .orderBy("timestamp", Query.Direction.ASCENDING)
+                .addSnapshotListener { snapshot, error ->
+                    if (error != null) {
+                        Log.e("ChatRepository", "getMessagesFlow error", error)
+                        return@addSnapshotListener
+                    }
+                    if (snapshot != null) {
+                        val messages = snapshot.documents.mapNotNull { doc ->
+                            try {
+                                MessageEntity(
+                                    id = doc.getLong("id") ?: 0L,
+                                    chatId = doc.getString("chatId") ?: "",
+                                    senderId = doc.getString("senderId") ?: "",
+                                    text = MessageEncryption.decrypt(doc.getString("text") ?: ""),
+                                    mediaUrl = doc.getString("mediaUrl"),
+                                    mediaType = doc.getString("mediaType"),
+                                    timestamp = doc.getLong("timestamp") ?: System.currentTimeMillis(),
+                                    status = doc.getString("status") ?: "SENT",
+                                    isStarred = doc.getBoolean("isStarred") ?: false,
+                                    replyToMessageId = doc.getLong("replyToMessageId"),
+                                    reactions = doc.getString("reactions") ?: ""
+                                )
+                            } catch (e: Exception) {
+                                null
+                            }
+                        }
+                        trySend(messages)
+                    }
+                }
+            awaitClose { listener.remove() }
+        }
     }
 
     suspend fun sendMessage(
@@ -179,92 +373,109 @@ class ChatRepository(private val context: Context) {
         mediaType: String? = null,
         replyToMessageId: Long? = null
     ): Long = withContext(Dispatchers.IO) {
+        val messageId = System.currentTimeMillis()
         val encryptedText = MessageEncryption.encrypt(text)
-        val cleanMyId = getSavedUserId()?.trim()?.replace("@", "") ?: "me"
-        val message = MessageEntity(
-            chatId = chatId,
-            senderId = cleanMyId,
-            text = encryptedText,
-            mediaUrl = mediaUrl,
-            mediaType = mediaType,
-            replyToMessageId = replyToMessageId,
-            status = "SENT"
+        val cleanMyId = getSavedUserId() ?: "me"
+
+        val message = hashMapOf(
+            "id" to messageId,
+            "chatId" to chatId,
+            "senderId" to cleanMyId,
+            "text" to encryptedText,
+            "mediaUrl" to mediaUrl,
+            "mediaType" to mediaType,
+            "timestamp" to System.currentTimeMillis(),
+            "status" to "SENT",
+            "isStarred" to false,
+            "replyToMessageId" to replyToMessageId,
+            "reactions" to ""
         )
-        
-        val messageId = messageDao.insertMessage(message)
-        
-        // Update last message in Chat List
+
+        // Write message document
+        Tasks.await(
+            firestore.collection("chats").document(chatId)
+                .collection("messages").document(messageId.toString())
+                .set(message)
+        )
+
+        // Update Chat summary details
         val lastMsgPreview = when {
             mediaType != null -> "📁 $mediaType"
             else -> text
         }
-        chatDao.updateLastMessage(chatId, lastMsgPreview, System.currentTimeMillis())
+        val updateChatMap = hashMapOf<String, Any>(
+            "lastMessage" to lastMsgPreview,
+            "lastMessageTime" to System.currentTimeMillis()
+        )
+        Tasks.await(firestore.collection("chats").document(chatId).update(updateChatMap))
 
-        // Handle Realtime network publishing or Gemini assistant locally
-        if (chatId == "gemini_assistant") {
-            handleGeminiResponse(text)
-        } else {
-            val cleanChatId = chatId.replace("@", "")
-            val isGroup = chatId.startsWith("group_") || chatId == "android_dev_group"
-            
-            val payload = JSONObject().apply {
-                put("messageId", messageId)
-                put("senderId", cleanMyId)
-                put("senderName", getSavedName())
-                put("text", encryptedText)
-                put("timestamp", System.currentTimeMillis())
-            }
-            
-            if (isGroup) {
-                payload.put("groupId", chatId)
-                val groupTopic = "connectchat_v1_msg_group_${chatId.replace("group_", "")}"
-                publishToNtfy(groupTopic, payload)
-            } else {
-                val peerTopic = "connectchat_v1_msg_$cleanChatId"
-                publishToNtfy(peerTopic, payload)
+        // Trigger AI helper response if talking to Gemini
+        if (chatId.contains("gemini_assistant")) {
+            repositoryScope.launch {
+                try {
+                    handleGeminiResponse(chatId, text)
+                } catch (e: Exception) {
+                    Log.e("ChatRepository", "Gemini generation error", e)
+                }
             }
         }
 
         messageId
     }
 
-    private suspend fun handleGeminiResponse(userMessage: String) {
+    private suspend fun handleGeminiResponse(chatId: String, userMessage: String) {
         val apiKey = BuildConfig.GEMINI_API_KEY
-        val chat = chatDao.getChatById("gemini_assistant") ?: return
         
-        // Simulate Typing Indicator by setting Gemini status to Typing
-        userDao.updateUserStatus("gemini_assistant", isOnline = true, System.currentTimeMillis())
-        
+        // Indicate typing
+        firestore.collection("users").document("gemini_assistant")
+            .update("statusText", "typing...")
+
         val responseText = if (apiKey.isEmpty() || apiKey == "MY_GEMINI_API_KEY") {
             delay(2000)
             "Hello! I am the Gemini AI Assistant.\n\n" +
             "To unlock real-time intelligence and dynamic replies from me, please enter your actual **Gemini API Key** in the **Secrets Panel** inside AI Studio with the name `GEMINI_API_KEY`.\n\n" +
             "Currently running in Offline Safe Mode. Try asking me other questions!"
         } else {
-            // Call Gemini API REST
-            val result = callGeminiApiRest(userMessage, apiKey)
-            result
+            callGeminiApiRest(userMessage, apiKey)
         }
 
-        val incomingMsg = MessageEntity(
-            chatId = "gemini_assistant",
-            senderId = "gemini_assistant",
-            text = MessageEncryption.encrypt(responseText),
-            status = "SEEN"
+        val incomingMsgId = System.currentTimeMillis()
+        val incomingMsg = hashMapOf(
+            "id" to incomingMsgId,
+            "chatId" to chatId,
+            "senderId" to "gemini_assistant",
+            "text" to MessageEncryption.encrypt(responseText),
+            "timestamp" to System.currentTimeMillis(),
+            "status" to "SEEN",
+            "isStarred" to false,
+            "replyToMessageId" to null,
+            "reactions" to ""
         )
-        messageDao.insertMessage(incomingMsg)
-        chatDao.updateLastMessage("gemini_assistant", responseText, System.currentTimeMillis())
-        
-        // Notify
-        notificationDao.insertNotification(
-            NotificationEntity(
-                id = "notif_${System.currentTimeMillis()}",
-                userId = "me",
-                title = "Gemini Assistant",
-                body = if (responseText.length > 50) responseText.take(50) + "..." else responseText,
-                timestamp = System.currentTimeMillis()
-            )
+
+        // Write Gemini's answer
+        Tasks.await(
+            firestore.collection("chats").document(chatId)
+                .collection("messages").document(incomingMsgId.toString())
+                .set(incomingMsg)
         )
+        Tasks.await(
+            firestore.collection("chats").document(chatId)
+                .update("lastMessage", responseText, "lastMessageTime", System.currentTimeMillis())
+        )
+
+        // Reset status
+        firestore.collection("users").document("gemini_assistant")
+            .update("statusText", "Online")
+
+        // Send local notification
+        val notif = NotificationEntity(
+            id = "notif_${System.currentTimeMillis()}",
+            userId = getSavedUserId() ?: "me",
+            title = "Gemini Assistant",
+            body = if (responseText.length > 50) responseText.take(50) + "..." else responseText,
+            timestamp = System.currentTimeMillis()
+        )
+        notificationDao.insertNotification(notif)
     }
 
     private suspend fun callGeminiApiRest(prompt: String, apiKey: String): String = withContext(Dispatchers.IO) {
@@ -276,7 +487,7 @@ class ChatRepository(private val context: Context) {
         val jsonRequest = JSONObject().apply {
             put("contents", JSONArray().put(JSONObject().apply {
                 put("parts", JSONArray().put(JSONObject().apply {
-                    put("text", "You are the smart Gemini Chat Assistant inside ConnectChat, a high-fidelity messaging app. Be friendly, helpful, short, and use emojis like a messenger contact. User says: $prompt")
+                    put("text", "You are the smart Gemini Chat Assistant inside ConnectChat. Be friendly, helpful, short, and use emojis like a messenger contact. User says: $prompt")
                 }))
             }))
         }
@@ -293,7 +504,7 @@ class ChatRepository(private val context: Context) {
         try {
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    return@withContext "Gemini service had an issue (Code: ${response.code}). Check your API Key."
+                    return@withContext "Gemini service had an issue (Code: ${response.code})."
                 }
                 val bodyStr = response.body?.string() ?: ""
                 val responseJson = JSONObject(bodyStr)
@@ -307,557 +518,329 @@ class ChatRepository(private val context: Context) {
                 text
             }
         } catch (e: Exception) {
-            e.printStackTrace()
             "Oops, I had trouble connecting to the network: ${e.localizedMessage}"
         }
     }
 
-    // --- Message Interactions ---
-    suspend fun starMessage(messageId: Long, isStarred: Boolean) {
-        messageDao.updateMessageStarred(messageId, isStarred)
-    }
-
-    suspend fun addReaction(messageId: Long, currentReactions: String, newReaction: String) {
-        val updated = if (currentReactions.isEmpty()) {
-            newReaction
-        } else if (currentReactions.contains(newReaction)) {
-            // Remove reaction if already present
-            currentReactions.replace(newReaction, "").replace(",,", ",").trim(',')
-        } else {
-            "$currentReactions,$newReaction"
-        }
-        messageDao.updateMessageReactions(messageId, updated)
-    }
-
-    suspend fun deleteMessageForMe(messageId: Long) {
-        messageDao.deleteMessage(messageId)
-    }
-
-    suspend fun deleteMessageForEveryone(messageId: Long, chatId: String) {
-        // Update database item to show "This message was deleted"
-        val deletedText = MessageEncryption.encrypt("🚫 This message was deleted")
-        val entity = messageDao.getStarredMessages() // temporary wait/get
-        messageDao.updateMessageStatus(messageId, "DELETED")
-        // Overwrite text to signify deleted for everyone
-        val currentMsgs = messageDao.getLatestMessageForChat(chatId)
-        if (currentMsgs?.id == messageId) {
-            chatDao.updateLastMessage(chatId, "🚫 Message deleted", System.currentTimeMillis())
-        }
-        messageDao.deleteMessage(messageId)
-    }
-
-    suspend fun clearChat(chatId: String) {
-        messageDao.clearChatHistory(chatId)
-        chatDao.updateLastMessage(chatId, "No messages yet", System.currentTimeMillis())
-    }
-
-    // --- Wallpaper and Settings ---
-    suspend fun updateChatWallpaper(chatId: String, wallpaperPath: String?) {
-        chatDao.updateWallpaper(chatId, wallpaperPath)
-    }
-
-    suspend fun getSettings(): UserSettingsEntity {
-        return settingsDao.getSettingsDirect("me") ?: UserSettingsEntity("me")
-    }
-
-    suspend fun saveSettings(settings: UserSettingsEntity) {
-        settingsDao.insertSettings(settings)
-    }
-
-    // --- Calls ---
-    suspend fun logCall(callerId: String, callerName: String, receiverId: String, receiverName: String, isVideo: Boolean, status: String, durationSec: Int) {
-        val call = CallEntity(
-            id = "call_${System.currentTimeMillis()}",
-            callerId = callerId,
-            callerName = callerName,
-            receiverId = receiverId,
-            receiverName = receiverName,
-            isVideo = isVideo,
-            status = status,
-            durationSec = durationSec
-        )
-        callDao.insertCall(call)
-    }
-
-    // --- Groups ---
-    suspend fun createGroup(name: String, description: String, memberIds: List<String>) {
-        val id = "group_${System.currentTimeMillis()}"
-        val cleanMyId = getSavedUserId()?.trim()?.replace("@", "") ?: "me"
-        val membersStr = (cleanMyId + "," + memberIds.joinToString(",")).trim(',')
-        val group = GroupEntity(
-            id = id,
-            name = name,
-            description = description,
-            createdBy = cleanMyId,
-            groupIcon = "",
-            adminIds = cleanMyId,
-            memberIds = membersStr
-        )
-        groupDao.insertGroup(group)
-
-        // Create Chat Entity
-        val chat = ChatEntity(
-            id = id,
-            name = name,
-            isGroup = true,
-            lastMessage = "Group created successfully!",
-            lastMessageTime = System.currentTimeMillis()
-        )
-        chatDao.insertChat(chat)
-    }
-
-    // --- Blocks ---
-    suspend fun blockUser(blockedUserId: String) {
-        val cleanMyId = getSavedUserId()?.trim()?.replace("@", "") ?: "me"
-        blockedUserDao.blockUser(BlockedUserEntity("${cleanMyId}_$blockedUserId", cleanMyId, blockedUserId))
-    }
-
-    suspend fun unblockUser(blockedUserId: String) {
-        val cleanMyId = getSavedUserId()?.trim()?.replace("@", "") ?: "me"
-        blockedUserDao.unblockUser(cleanMyId, blockedUserId)
-    }
-
-    suspend fun isUserBlocked(blockedUserId: String): Boolean {
-        val cleanMyId = getSavedUserId()?.trim()?.replace("@", "") ?: "me"
-        return blockedUserDao.isUserBlocked(cleanMyId, blockedUserId)
-    }
-
-    // --- Real-Time Pub-Sub Server Subscriptions (ntfy.sh) ---
-    fun startRealtimeConnection(myId: String) {
-        realtimeJob?.cancel()
-        realtimeJob = repositoryScope.launch {
-            val cleanMyId = myId.trim().replace("@", "")
-
-            // Periodically broadcast ourselves so other users can discover us
-            launch {
-                while (true) {
-                    try {
-                        broadcastDiscovery(myId)
-                    } catch (e: Exception) {
-                        Log.e("ChatRepository", "Error broadcasting discovery", e)
-                    }
-                    delay(30000) // every 30 seconds
-                }
-            }
-
-            // Build subscription topics list
-            val baseTopics = listOf(
-                "connectchat_v1_discovery",
-                "connectchat_v1_friendreq_$cleanMyId",
-                "connectchat_v1_msg_$cleanMyId"
-            )
-
-            var delayMs = 1000L
-            while (true) {
-                try {
-                    val groups = groupDao.getAllGroupsDirect()
-                    val groupTopics = groups.map { "connectchat_v1_msg_group_${it.id.replace("group_", "")}" }
-                    val allTopics = baseTopics + groupTopics
-                    val topicsStr = allTopics.joinToString(",")
-
-                    val url = "https://ntfy.sh/$topicsStr/json"
-                    val request = Request.Builder()
-                        .url(url)
-                        .get()
-                        .build()
-
-                    val client = OkHttpClient.Builder()
-                        .readTimeout(0, TimeUnit.MILLISECONDS) // Infinite timeout for long lived stream
-                        .build()
-
-                    Log.d("ChatRepository", "Opening SSE connection to ntfy.sh with topics: $topicsStr")
-
-                    client.newCall(request).execute().use { response ->
-                        if (!response.isSuccessful) {
-                            throw Exception("Server returned code ${response.code}")
-                        }
-
-                        val reader = response.body?.charStream()?.buffered() ?: throw Exception("No response body")
-                        delayMs = 1000L // Reset retry delay on success
-
-                        var line = reader.readLine()
-                        while (line != null) {
-                            try {
-                                handleIncomingServerMessage(line, myId)
-                            } catch (e: Exception) {
-                                Log.e("ChatRepository", "Error parsing SSE line", e)
-                            }
-                            line = reader.readLine()
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.e("ChatRepository", "SSE connection lost, retrying in ${delayMs / 1000}s", e)
-                    delay(delayMs)
-                    delayMs = (delayMs * 2).coerceAtMost(60000L) // Exponential backoff
-                }
-            }
-        }
-    }
-
-    private suspend fun broadcastDiscovery(myId: String) = withContext(Dispatchers.IO) {
-        val cleanMyId = myId.trim().replace("@", "")
-        val payload = JSONObject().apply {
-            put("id", cleanMyId)
-            put("name", getSavedName())
-            put("bio", getSavedBio())
-            put("statusText", "Online")
-            put("isOnline", true)
-            put("timestamp", System.currentTimeMillis())
-        }
-        publishToNtfy("connectchat_v1_discovery", payload)
-    }
-
-    private suspend fun publishToNtfy(topic: String, payload: JSONObject) = withContext(Dispatchers.IO) {
+    // --- Message Interactions (using collectionGroup for universal matching) ---
+    suspend fun starMessage(messageId: Long, isStarred: Boolean) = withContext(Dispatchers.IO) {
         try {
-            val requestBody = payload.toString().toRequestBody("text/plain".toMediaType())
-            val request = Request.Builder()
-                .url("https://ntfy.sh/$topic")
-                .post(requestBody)
-                .build()
-
-            OkHttpClient().newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    Log.e("ChatRepository", "Failed to publish to $topic: ${response.code}")
-                }
+            val query = firestore.collectionGroup("messages").whereEqualTo("id", messageId)
+            val snapshot = Tasks.await(query.get())
+            for (doc in snapshot.documents) {
+                Tasks.await(doc.reference.update("isStarred", isStarred))
             }
         } catch (e: Exception) {
-            Log.e("ChatRepository", "Error publishing to $topic", e)
+            Log.e("ChatRepository", "starMessage failed", e)
         }
     }
 
-    private suspend fun handleIncomingServerMessage(line: String, myId: String) {
-        val cleanMyId = myId.trim().replace("@", "")
-        val sseObj = JSONObject(line)
-        if (sseObj.optString("event") != "message") return
-
-        val topic = sseObj.optString("topic")
-        val messageStr = sseObj.optString("message")
-        if (messageStr.isEmpty()) return
-
-        val payload = try {
-            JSONObject(messageStr)
+    suspend fun addReaction(messageId: Long, currentReactions: String, newReaction: String) = withContext(Dispatchers.IO) {
+        try {
+            val updated = if (currentReactions.isEmpty()) {
+                newReaction
+            } else if (currentReactions.contains(newReaction)) {
+                currentReactions.replace(newReaction, "").replace(",,", ",").trim(',')
+            } else {
+                "$currentReactions,$newReaction"
+            }
+            val query = firestore.collectionGroup("messages").whereEqualTo("id", messageId)
+            val snapshot = Tasks.await(query.get())
+            for (doc in snapshot.documents) {
+                Tasks.await(doc.reference.update("reactions", updated))
+            }
         } catch (e: Exception) {
-            return
-        }
-
-        when {
-            topic == "connectchat_v1_discovery" -> {
-                val userId = payload.optString("id")
-                if (userId.isEmpty() || userId == cleanMyId) return
-
-                val user = UserEntity(
-                    id = userId,
-                    name = payload.optString("name", "User"),
-                    photoUrl = "",
-                    bio = payload.optString("bio", ""),
-                    statusText = payload.optString("statusText", "Online"),
-                    isOnline = payload.optBoolean("isOnline", true),
-                    lastSeen = payload.optLong("timestamp", System.currentTimeMillis())
-                )
-                userDao.insertUser(user)
-            }
-
-            topic == "connectchat_v1_friendreq_$cleanMyId" -> {
-                val type = payload.optString("type")
-                val requestId = payload.optLong("requestId", 0L)
-                val senderId = payload.optString("senderId")
-                val senderName = payload.optString("senderName")
-                val receiverId = payload.optString("receiverId")
-                val timestamp = payload.optLong("timestamp", System.currentTimeMillis())
-
-                when (type) {
-                    "REQUEST" -> {
-                        val existing = friendRequestDao.getFriendRequestBetween(senderId, cleanMyId)
-                        if (existing == null || existing.status != "ACCEPTED") {
-                            val request = FriendRequestEntity(
-                                id = requestId,
-                                senderId = senderId,
-                                senderName = senderName,
-                                receiverId = cleanMyId,
-                                status = "PENDING",
-                                timestamp = timestamp
-                            )
-                            friendRequestDao.insertFriendRequest(request)
-
-                            val existingUser = userDao.getUserById(senderId)
-                            if (existingUser == null) {
-                                userDao.insertUser(
-                                    UserEntity(senderId, senderName, "", "Hey there! Let's chat.", "Online", true, System.currentTimeMillis())
-                                )
-                            }
-
-                            notificationDao.insertNotification(
-                                NotificationEntity(
-                                    id = "notif_${System.currentTimeMillis()}",
-                                    userId = "me",
-                                    title = "Friend Request Received",
-                                    body = "$senderName wants to connect with you!",
-                                    timestamp = System.currentTimeMillis()
-                                )
-                            )
-                        }
-                    }
-                    "ACCEPTED" -> {
-                        val requests = friendRequestDao.getAllFriendRequestsFlow(cleanMyId).firstOrNull() ?: emptyList()
-                        val req = requests.find { it.senderId == cleanMyId && it.receiverId == senderId }
-                        if (req != null) {
-                            friendRequestDao.updateFriendRequestStatus(req.id, "ACCEPTED")
-                        } else {
-                            val newReq = FriendRequestEntity(
-                                id = requestId,
-                                senderId = cleanMyId,
-                                senderName = getSavedName(),
-                                receiverId = senderId,
-                                status = "ACCEPTED",
-                                timestamp = timestamp
-                            )
-                            friendRequestDao.insertFriendRequest(newReq)
-                        }
-
-                        // Create Chat
-                        val chat = ChatEntity(
-                            id = senderId,
-                            name = senderName,
-                            isGroup = false,
-                            lastMessage = "You are now connected! Say hello. 👋",
-                            lastMessageTime = timestamp
-                        )
-                        chatDao.insertChat(chat)
-
-                        // Seed initial message
-                        val welcomeMsg = MessageEntity(
-                            chatId = senderId,
-                            senderId = senderId,
-                            text = MessageEncryption.encrypt("Thanks for accepting my request! Let's chat. 😊"),
-                            timestamp = timestamp,
-                            status = "DELIVERED"
-                        )
-                        messageDao.insertMessage(welcomeMsg)
-
-                        notificationDao.insertNotification(
-                            NotificationEntity(
-                                id = "notif_${System.currentTimeMillis()}",
-                                userId = "me",
-                                title = "Friend Request Accepted",
-                                body = "$senderName accepted your friend request!",
-                                timestamp = System.currentTimeMillis()
-                            )
-                        )
-                    }
-                    "DECLINED" -> {
-                        val requests = friendRequestDao.getAllFriendRequestsFlow(cleanMyId).firstOrNull() ?: emptyList()
-                        val req = requests.find { it.senderId == cleanMyId && it.receiverId == senderId }
-                        if (req != null) {
-                            friendRequestDao.updateFriendRequestStatus(req.id, "DECLINED")
-                        }
-                    }
-                }
-            }
-
-            topic == "connectchat_v1_msg_$cleanMyId" -> {
-                val senderId = payload.optString("senderId")
-                val senderName = payload.optString("senderName")
-                val text = payload.optString("text")
-                val timestamp = payload.optLong("timestamp", System.currentTimeMillis())
-
-                if (senderId.isEmpty() || senderId == cleanMyId) return
-                if (isUserBlocked(senderId)) return
-
-                val msg = MessageEntity(
-                    chatId = senderId,
-                    senderId = senderId,
-                    text = text,
-                    timestamp = timestamp,
-                    status = "DELIVERED"
-                )
-                messageDao.insertMessage(msg)
-
-                val decrypted = MessageEncryption.decrypt(text)
-
-                val chat = chatDao.getChatById(senderId)
-                if (chat != null) {
-                    chatDao.updateLastMessage(senderId, decrypted, timestamp)
-                } else {
-                    val newChat = ChatEntity(
-                        id = senderId,
-                        name = senderName,
-                        isGroup = false,
-                        lastMessage = decrypted,
-                        lastMessageTime = timestamp
-                    )
-                    chatDao.insertChat(newChat)
-                }
-
-                notificationDao.insertNotification(
-                    NotificationEntity(
-                        id = "notif_${System.currentTimeMillis()}",
-                        userId = "me",
-                        title = senderName,
-                        body = decrypted,
-                        timestamp = System.currentTimeMillis()
-                    )
-                )
-            }
-
-            topic.startsWith("connectchat_v1_msg_group_") -> {
-                val groupId = payload.optString("groupId")
-                val senderId = payload.optString("senderId")
-                val senderName = payload.optString("senderName")
-                val text = payload.optString("text")
-                val timestamp = payload.optLong("timestamp", System.currentTimeMillis())
-
-                if (senderId == cleanMyId) return
-
-                val msg = MessageEntity(
-                    chatId = groupId,
-                    senderId = senderId,
-                    text = text,
-                    timestamp = timestamp,
-                    status = "DELIVERED"
-                )
-                messageDao.insertMessage(msg)
-
-                val decrypted = MessageEncryption.decrypt(text)
-                chatDao.updateLastMessage(groupId, "$senderName: $decrypted", timestamp)
-
-                notificationDao.insertNotification(
-                    NotificationEntity(
-                        id = "notif_${System.currentTimeMillis()}",
-                        userId = "me",
-                        title = "Group: " + (chatDao.getChatById(groupId)?.name ?: "Android Dev Team"),
-                        body = "$senderName: $decrypted",
-                        timestamp = System.currentTimeMillis()
-                    )
-                )
-            }
+            Log.e("ChatRepository", "addReaction failed", e)
         }
     }
 
-    // --- Friend Request System ---
-    val friendRequestDao = database.friendRequestDao()
+    suspend fun deleteMessageForMe(messageId: Long) = withContext(Dispatchers.IO) {
+        try {
+            val query = firestore.collectionGroup("messages").whereEqualTo("id", messageId)
+            val snapshot = Tasks.await(query.get())
+            for (doc in snapshot.documents) {
+                Tasks.await(doc.reference.delete())
+            }
+        } catch (e: Exception) {
+            Log.e("ChatRepository", "deleteMessageForMe failed", e)
+        }
+    }
 
+    suspend fun deleteMessageForEveryone(messageId: Long, chatId: String) = withContext(Dispatchers.IO) {
+        try {
+            val query = firestore.collectionGroup("messages").whereEqualTo("id", messageId)
+            val snapshot = Tasks.await(query.get())
+            for (doc in snapshot.documents) {
+                Tasks.await(
+                    doc.reference.update(
+                        "status", "DELETED",
+                        "text", MessageEncryption.encrypt("🚫 This message was deleted")
+                    )
+                )
+            }
+        } catch (e: Exception) {
+            Log.e("ChatRepository", "deleteMessageForEveryone failed", e)
+        }
+    }
+
+    suspend fun clearChat(chatId: String) = withContext(Dispatchers.IO) {
+        try {
+            val msgs = Tasks.await(firestore.collection("chats").document(chatId).collection("messages").get())
+            for (doc in msgs.documents) {
+                Tasks.await(doc.reference.delete())
+            }
+            Tasks.await(firestore.collection("chats").document(chatId).update("lastMessage", "No messages yet"))
+        } catch (e: Exception) {
+            Log.e("ChatRepository", "clearChat failed", e)
+        }
+    }
+
+    suspend fun updateChatWallpaper(chatId: String, wallpaperPath: String?) {
+        try {
+            Tasks.await(firestore.collection("chats").document(chatId).update("wallpaperPath", wallpaperPath))
+        } catch (e: Exception) {
+            Log.e("ChatRepository", "updateChatWallpaper failed", e)
+        }
+    }
+
+    suspend fun getSettings(): UserSettingsEntity = withContext(Dispatchers.IO) {
+        val currentUid = getSavedUserId() ?: "me"
+        try {
+            val doc = Tasks.await(firestore.collection("user_settings").document(currentUid).get())
+            if (doc.exists()) {
+                UserSettingsEntity(
+                    userId = currentUid,
+                    isDarkMode = doc.getBoolean("isDarkMode") ?: false,
+                    isTwoFactorEnabled = doc.getBoolean("isTwoFactorEnabled") ?: false,
+                    notificationsSoundEnabled = doc.getBoolean("notificationsSoundEnabled") ?: true,
+                    privacyStatus = doc.getString("privacyStatus") ?: "EVERYONE",
+                    lastSeenPrivacy = doc.getString("lastSeenPrivacy") ?: "EVERYONE"
+                )
+            } else {
+                UserSettingsEntity(currentUid)
+            }
+        } catch (e: Exception) {
+            UserSettingsEntity(currentUid)
+        }
+    }
+
+    suspend fun saveSettings(settings: UserSettingsEntity) = withContext(Dispatchers.IO) {
+        val currentUid = getSavedUserId() ?: "me"
+        val settingsMap = hashMapOf(
+            "userId" to currentUid,
+            "isDarkMode" to settings.isDarkMode,
+            "isTwoFactorEnabled" to settings.isTwoFactorEnabled,
+            "notificationsSoundEnabled" to settings.notificationsSoundEnabled,
+            "privacyStatus" to settings.privacyStatus,
+            "lastSeenPrivacy" to settings.lastSeenPrivacy
+        )
+        try {
+            Tasks.await(firestore.collection("user_settings").document(currentUid).set(settingsMap))
+        } catch (e: Exception) {
+            Log.e("ChatRepository", "saveSettings failed", e)
+        }
+    }
+
+    suspend fun logCall(
+        callerId: String,
+        callerName: String,
+        receiverId: String,
+        receiverName: String,
+        isVideo: Boolean,
+        status: String,
+        durationSec: Int
+    ) = withContext(Dispatchers.IO) {
+        val id = "call_${System.currentTimeMillis()}"
+        val callMap = hashMapOf(
+            "id" to id,
+            "callerId" to callerId,
+            "callerName" to callerName,
+            "receiverId" to receiverId,
+            "receiverName" to receiverName,
+            "isVideo" to isVideo,
+            "status" to status,
+            "startTime" to System.currentTimeMillis(),
+            "durationSec" to durationSec
+        )
+        try {
+            Tasks.await(firestore.collection("calls").document(id).set(callMap))
+        } catch (e: Exception) {
+            Log.e("ChatRepository", "logCall failed", e)
+        }
+    }
+
+    suspend fun createGroup(name: String, description: String, memberIds: List<String>) = withContext(Dispatchers.IO) {
+        val id = "group_${System.currentTimeMillis()}"
+        val cleanMyId = getSavedUserId() ?: "me"
+        val allMembers = (memberIds + cleanMyId).distinct()
+
+        val groupChat = hashMapOf(
+            "id" to id,
+            "name" to name,
+            "isGroup" to true,
+            "participants" to allMembers,
+            "lastMessage" to "Group created: $description",
+            "lastMessageTime" to System.currentTimeMillis(),
+            "adminUid" to cleanMyId
+        )
+        try {
+            Tasks.await(firestore.collection("chats").document(id).set(groupChat))
+        } catch (e: Exception) {
+            Log.e("ChatRepository", "createGroup failed", e)
+        }
+    }
+
+    suspend fun blockUser(userId: String) = withContext(Dispatchers.IO) {
+        val currentUid = getSavedUserId() ?: "me"
+        val id = "${currentUid}_$userId"
+        val blockedMap = hashMapOf(
+            "id" to id,
+            "userId" to currentUid,
+            "blockedUserId" to userId
+        )
+        try {
+            Tasks.await(firestore.collection("blocked_users").document(id).set(blockedMap))
+        } catch (e: Exception) {
+            Log.e("ChatRepository", "blockUser failed", e)
+        }
+    }
+
+    suspend fun unblockUser(userId: String) = withContext(Dispatchers.IO) {
+        val currentUid = getSavedUserId() ?: "me"
+        val id = "${currentUid}_$userId"
+        try {
+            Tasks.await(firestore.collection("blocked_users").document(id).delete())
+        } catch (e: Exception) {
+            Log.e("ChatRepository", "unblockUser failed", e)
+        }
+    }
+
+    // --- Friend Requests & Search ---
     fun getFriendRequestsFlow(myId: String): Flow<List<FriendRequestEntity>> {
-        val cleanMyId = getSavedUserId()?.trim()?.replace("@", "") ?: "me"
-        return friendRequestDao.getAllFriendRequestsFlow(cleanMyId)
+        return authStateFlow.flatMapLatest { uid ->
+            val currentUid = uid ?: getSavedUserId() ?: "me"
+            if (currentUid == "me") {
+                flowOf(emptyList())
+            } else {
+                callbackFlow {
+                    val listener = firestore.collection("friend_requests")
+                        .whereEqualTo("receiverId", currentUid)
+                        .whereEqualTo("status", "PENDING")
+                        .addSnapshotListener { snapshot, error ->
+                            if (error != null) return@addSnapshotListener
+                            if (snapshot != null) {
+                                val list = snapshot.documents.mapNotNull { doc ->
+                                    try {
+                                        FriendRequestEntity(
+                                            id = doc.getLong("id") ?: 0L,
+                                            senderId = doc.getString("senderId") ?: "",
+                                            senderName = doc.getString("senderName") ?: "User",
+                                            receiverId = doc.getString("receiverId") ?: "",
+                                            status = doc.getString("status") ?: "PENDING",
+                                            timestamp = doc.getLong("timestamp") ?: System.currentTimeMillis()
+                                        )
+                                    } catch (e: Exception) {
+                                        null
+                                    }
+                                }
+                                trySend(list)
+                            }
+                        }
+                    awaitClose { listener.remove() }
+                }
+            }
+        }
     }
 
     fun getPendingRequestsFlow(myId: String): Flow<List<FriendRequestEntity>> {
-        val cleanMyId = getSavedUserId()?.trim()?.replace("@", "") ?: "me"
-        return friendRequestDao.getPendingRequestsForMe(cleanMyId)
-    }
-
-    fun getAcceptedRequestsFlow(myId: String): Flow<List<FriendRequestEntity>> {
-        val cleanMyId = getSavedUserId()?.trim()?.replace("@", "") ?: "me"
-        return friendRequestDao.getAcceptedFriendRequestsFlow(cleanMyId)
+        return authStateFlow.flatMapLatest { uid ->
+            val currentUid = uid ?: getSavedUserId() ?: "me"
+            if (currentUid == "me") {
+                flowOf(emptyList())
+            } else {
+                callbackFlow {
+                    val listener = firestore.collection("friend_requests")
+                        .whereEqualTo("senderId", currentUid)
+                        .whereEqualTo("status", "PENDING")
+                        .addSnapshotListener { snapshot, error ->
+                            if (error != null) return@addSnapshotListener
+                            if (snapshot != null) {
+                                val list = snapshot.documents.mapNotNull { doc ->
+                                    try {
+                                        FriendRequestEntity(
+                                            id = doc.getLong("id") ?: 0L,
+                                            senderId = doc.getString("senderId") ?: "",
+                                            senderName = doc.getString("senderName") ?: "User",
+                                            receiverId = doc.getString("receiverId") ?: "",
+                                            status = doc.getString("status") ?: "PENDING",
+                                            timestamp = doc.getLong("timestamp") ?: System.currentTimeMillis()
+                                        )
+                                    } catch (e: Exception) {
+                                        null
+                                    }
+                                }
+                                trySend(list)
+                            }
+                        }
+                    awaitClose { listener.remove() }
+                }
+            }
+        }
     }
 
     suspend fun sendFriendRequest(senderId: String, senderName: String, receiverId: String) = withContext(Dispatchers.IO) {
-        val cleanReceiverId = receiverId.trim().replace("@", "")
-        val cleanMyId = getSavedUserId()?.trim()?.replace("@", "") ?: "me"
-        
-        // Find if user exists
-        val receiver = userDao.getUserById(cleanReceiverId)
-        val receiverName = receiver?.name ?: cleanReceiverId
-        
-        if (cleanReceiverId == cleanMyId) {
-            throw IllegalArgumentException("You cannot send a friend request to yourself.")
-        }
-        
-        // Check if already friends or pending
-        val existing = friendRequestDao.getFriendRequestBetween(cleanMyId, cleanReceiverId)
-        if (existing != null) {
-            if (existing.status == "ACCEPTED") {
-                throw IllegalArgumentException("You are already friends.")
-            } else if (existing.status == "PENDING") {
-                throw IllegalArgumentException("A friend request is already pending.")
-            }
-        }
+        val currentUid = getSavedUserId() ?: "me"
+        val cleanReceiverId = receiverId.replace("@", "").trim()
+        val requestId = System.currentTimeMillis()
 
-        val requestTime = System.currentTimeMillis()
-        val requestId = requestTime
-
-        // Insert new friend request locally
-        val request = FriendRequestEntity(
-            id = requestId,
-            senderId = cleanMyId,
-            senderName = getSavedName(),
-            receiverId = cleanReceiverId,
-            status = "PENDING",
-            timestamp = requestTime
+        val request = hashMapOf(
+            "id" to requestId,
+            "senderId" to currentUid,
+            "senderName" to senderName,
+            "receiverId" to cleanReceiverId,
+            "status" to "PENDING",
+            "timestamp" to System.currentTimeMillis()
         )
-        friendRequestDao.insertFriendRequest(request)
-
-        // Publish friend request over real-time server
-        val payload = JSONObject().apply {
-            put("type", "REQUEST")
-            put("requestId", requestId)
-            put("senderId", cleanMyId)
-            put("senderName", getSavedName())
-            put("receiverId", cleanReceiverId)
-            put("timestamp", requestTime)
+        try {
+            Tasks.await(firestore.collection("friend_requests").document(requestId.toString()).set(request))
+        } catch (e: Exception) {
+            Log.e("ChatRepository", "sendFriendRequest failed", e)
         }
-        
-        publishToNtfy("connectchat_v1_friendreq_$cleanReceiverId", payload)
     }
 
     suspend fun acceptFriendRequest(requestId: Long, myId: String) = withContext(Dispatchers.IO) {
-        val cleanMyId = getSavedUserId()?.trim()?.replace("@", "") ?: "me"
-        val requests = friendRequestDao.getAllFriendRequestsFlow(cleanMyId).firstOrNull() ?: emptyList()
-        val request = requests.find { it.id == requestId } ?: return@withContext
-        
-        friendRequestDao.updateFriendRequestStatus(requestId, "ACCEPTED")
-        
-        // Create Chat Entity
-        val chat = ChatEntity(
-            id = request.senderId,
-            name = request.senderName,
-            isGroup = false,
-            lastMessage = "You are now connected! Say hello. 👋",
-            lastMessageTime = System.currentTimeMillis()
-        )
-        chatDao.insertChat(chat)
+        val currentUid = getSavedUserId() ?: "me"
+        try {
+            // Update status to ACCEPTED
+            Tasks.await(firestore.collection("friend_requests").document(requestId.toString()).update("status", "ACCEPTED"))
 
-        // Seed initial friendly message
-        val welcomeMsg = MessageEntity(
-            chatId = request.senderId,
-            senderId = request.senderId,
-            text = MessageEncryption.encrypt("Thanks for accepting my request! Let's chat. 😊"),
-            timestamp = System.currentTimeMillis(),
-            status = "DELIVERED"
-        )
-        messageDao.insertMessage(welcomeMsg)
+            // Retrieve details to build 1-to-1 chat document
+            val doc = Tasks.await(firestore.collection("friend_requests").document(requestId.toString()).get())
+            val senderId = doc.getString("senderId") ?: ""
+            val senderName = doc.getString("senderName") ?: "User"
 
-        // Publish acceptance payload
-        val payload = JSONObject().apply {
-            put("type", "ACCEPTED")
-            put("requestId", requestId)
-            put("senderId", cleanMyId)
-            put("senderName", getSavedName())
-            put("receiverId", request.senderId)
-            put("timestamp", System.currentTimeMillis())
+            val sortedUids = listOf(currentUid, senderId).sorted()
+            val chatId = "chat_${sortedUids[0]}_${sortedUids[1]}"
+
+            val chat = hashMapOf(
+                "id" to chatId,
+                "name" to senderName,
+                "participants" to listOf(currentUid, senderId),
+                "isGroup" to false,
+                "lastMessage" to "You are now connected! Say hello.",
+                "lastMessageTime" to System.currentTimeMillis()
+            )
+            Tasks.await(firestore.collection("chats").document(chatId).set(chat))
+        } catch (e: Exception) {
+            Log.e("ChatRepository", "acceptFriendRequest failed", e)
         }
-        
-        publishToNtfy("connectchat_v1_friendreq_${request.senderId}", payload)
     }
 
     suspend fun declineFriendRequest(requestId: Long) = withContext(Dispatchers.IO) {
-        val cleanMyId = getSavedUserId()?.trim()?.replace("@", "") ?: "me"
-        val requests = friendRequestDao.getAllFriendRequestsFlow(cleanMyId).firstOrNull() ?: emptyList()
-        val request = requests.find { it.id == requestId } ?: return@withContext
-        
-        friendRequestDao.updateFriendRequestStatus(requestId, "DECLINED")
-
-        // Publish decline payload
-        val payload = JSONObject().apply {
-            put("type", "DECLINED")
-            put("requestId", requestId)
-            put("senderId", cleanMyId)
-            put("senderName", getSavedName())
-            put("receiverId", request.senderId)
-            put("timestamp", System.currentTimeMillis())
+        try {
+            Tasks.await(firestore.collection("friend_requests").document(requestId.toString()).update("status", "DECLINED"))
+        } catch (e: Exception) {
+            Log.e("ChatRepository", "declineFriendRequest failed", e)
         }
-        
-        publishToNtfy("connectchat_v1_friendreq_${request.senderId}", payload)
     }
 }
-

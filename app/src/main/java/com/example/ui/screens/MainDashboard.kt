@@ -362,9 +362,9 @@ fun CallsTab(calls: List<CallEntity>, viewModel: ChatViewModel) {
     } else {
         LazyColumn(modifier = Modifier.fillMaxSize()) {
             items(calls) { call ->
-                CallListItem(call = call) {
-                    val targetName = if (call.callerId == "me") call.receiverName else call.callerName
-                    val targetId = if (call.callerId == "me") call.receiverId else call.callerId
+                CallListItem(call = call, myUserId = viewModel.myUserId.value) {
+                    val targetName = if (call.callerId == viewModel.myUserId.value) call.receiverName else call.callerName
+                    val targetId = if (call.callerId == viewModel.myUserId.value) call.receiverId else call.callerId
                     viewModel.startCall(targetName, call.isVideo, targetId)
                 }
             }
@@ -530,9 +530,9 @@ fun ChatListItem(chat: ChatEntity, onClick: () -> Unit) {
 }
 
 @Composable
-fun CallListItem(call: CallEntity, onClick: () -> Unit) {
+fun CallListItem(call: CallEntity, myUserId: String, onClick: () -> Unit) {
     val dateStr = SimpleDateFormat("MMM dd, HH:mm", Locale.getDefault()).format(Date(call.startTime))
-    val callerLabel = if (call.callerId == "me") call.receiverName else call.callerName
+    val callerLabel = if (call.callerId == myUserId) call.receiverName else call.callerName
     val isMissed = call.status == "MISSED"
 
     Row(
@@ -572,7 +572,7 @@ fun CallListItem(call: CallEntity, onClick: () -> Unit) {
 
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
-                    imageVector = if (call.callerId == "me") Icons.Default.ArrowUpward else Icons.Default.ArrowDownward,
+                    imageVector = if (call.callerId == myUserId) Icons.Default.ArrowUpward else Icons.Default.ArrowDownward,
                     contentDescription = null,
                     tint = if (isMissed) MaterialTheme.colorScheme.error else Color.Green,
                     modifier = Modifier.size(14.dp)

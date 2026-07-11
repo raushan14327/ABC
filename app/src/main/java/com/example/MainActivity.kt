@@ -11,10 +11,12 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ui.screens.MainAppContainer
 import com.example.ui.theme.MyApplicationTheme
 import com.example.ui.viewmodel.ChatViewModel
+import com.google.firebase.FirebaseApp
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        FirebaseApp.initializeApp(this)
         enableEdgeToEdge()
         setContent {
             MyApplicationTheme {

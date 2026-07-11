@@ -10,6 +10,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.database.*
 import com.example.data.encryption.MessageEncryption
 import com.example.data.repository.ChatRepository
+import com.example.data.repository.AuthRepository
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
@@ -42,6 +43,7 @@ data class CallingState(
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repository = ChatRepository(application)
+    private val authRepository = AuthRepository(application)
 
     // Navigation & Screen management
     private val _currentScreen = MutableStateFlow<AppScreen>(AppScreen.Onboarding)
@@ -95,7 +97,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     val activeChatWallpaper = MutableStateFlow<String?>(null)
 
     // User settings
-    private val _settings = MutableStateFlow(UserSettingsEntity("me"))
+    private val _settings = MutableStateFlow(UserSettingsEntity(""))
     val settings: StateFlow<UserSettingsEntity> = _settings.asStateFlow()
 
     // Group Member Addition Temp lists
@@ -130,7 +132,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
             // Fetch standard users list for group invite
             repository.userDao.getAllUsers().collect {
-                usersList.value = it.filter { user -> user.id != "me" && user.id != myUserId.value.replace("@", "") }
+                usersList.value = it.filter { user -> user.id != myUserId.value && user.id != myUserId.value.replace("@", "") }
             }
         }
     }
@@ -178,7 +180,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             repository.saveUserIdentity(cleanId, name, phone, bio)
             
             repository.userDao.insertUser(
-                UserEntity("me", name, "", bio, "Online", true, System.currentTimeMillis())
+                UserEntity(cleanId, name, "", bio, "Online", true, System.currentTimeMillis())
             )
             navigateTo(AppScreen.Dashboard)
         }
@@ -188,7 +190,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun sendFriendRequest(receiverId: String, onSuccess: () -> Unit, onError: (String) -> Unit) {
         viewModelScope.launch {
             try {
-                repository.sendFriendRequest("me", myName.value, receiverId)
+                repository.sendFriendRequest(myUserId.value, myName.value, receiverId)
                 onSuccess()
             } catch (e: Exception) {
                 onError(e.localizedMessage ?: "Failed to send friend request.")
@@ -199,7 +201,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun acceptFriendRequest(requestId: Long) {
         viewModelScope.launch {
             try {
-                repository.acceptFriendRequest(requestId, "me")
+                repository.acceptFriendRequest(requestId, myUserId.value)
             } catch (e: Exception) {
                 Log.e("ChatViewModel", "Error accepting request", e)
             }
@@ -314,9 +316,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             // Log to database
             repository.logCall(
-                callerId = if (finalState.isIncoming) finalState.chatId else "me",
+                callerId = if (finalState.isIncoming) finalState.chatId else myUserId.value,
                 callerName = if (finalState.isIncoming) finalState.callerName else "You (Me)",
-                receiverId = if (finalState.isIncoming) "me" else finalState.chatId,
+                receiverId = if (finalState.isIncoming) myUserId.value else finalState.chatId,
                 receiverName = if (finalState.isIncoming) "You (Me)" else finalState.callerName,
                 isVideo = finalState.isVideo,
                 status = if (finalState.status == "CONNECTED") "COMPLETED" else if (finalState.isIncoming) "MISSED" else "REJECTED",

@@ -154,7 +154,7 @@ fun ChatScreen(
                     items(filteredMessages) { message ->
                         MessageBubble(
                             message = message,
-                            isMe = message.senderId == "me",
+                            isMe = message.senderId == viewModel.myUserId.value,
                             isDark = isDarkMode.isDarkMode,
                             onLongClick = {
                                 selectedMessageForActions = message
@@ -174,7 +174,7 @@ fun ChatScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Replying to ${if (replyingToMessage!!.senderId == "me") "You" else chatName}",
+                                text = "Replying to ${if (replyingToMessage!!.senderId == viewModel.myUserId.value) "You" else chatName}",
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 12.sp,
                                 color = MaterialTheme.colorScheme.primary
