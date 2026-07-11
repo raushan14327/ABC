@@ -1,0 +1,6 @@
+{
+  "name": "ConnectChat",
+  "description": "A production-ready WhatsApp-like real-time messaging application with rich media, group chat, WebRTC calling simulation, end-to-end security, and an admin analytics panel.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
